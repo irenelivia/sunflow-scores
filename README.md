@@ -356,13 +356,4 @@ Tests cover:
 
 ## 🤝 Contributing
 
-Contributions are welcome. For bug reports or feature requests, open an issue on GitHub.
-When submitting PRs:
-- Include tests for new functionality
-- Update the README if adding new scripts or CLI arguments
-- Run `pytest` before submitting
-- Ensure code follows the project's import/style patterns (see existing scripts)
-
-## 📄 License
-
-MIT. See LICENSE file for details.
+Contributions are welcome. For bug reports or feature suggestions, open an issue on GitHub.
