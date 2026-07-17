@@ -31,7 +31,10 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from validator import SatelliteNowcastLoader, SatelliteObservationLoader
+try:
+    from src.sunflow_scores.validator import SatelliteNowcastLoader, SatelliteObservationLoader
+except ModuleNotFoundError:
+    from validator import SatelliteNowcastLoader, SatelliteObservationLoader
 
 
 # =============================================================================

@@ -14,6 +14,15 @@ notebooks/results/
 notebooks/*.ipynb
 *.code-workspace
 
+# Generated output (plots, GIFs, logs, results)
+plots/
+plots_compare/
+*-plots/
+demo_outputs/
+gifs/
+logs/
+*.gif
+
 # Data files
 results/
 *.nc
@@ -22,3 +31,14 @@ results/
 dist/
 build/
 *.egg-info/
+
+# IDE
+.idea/
+
+# Validation shell scripts (DMI-internal; user creates locally)
+run_validation_dmi.sh
+
+# Local plotting scripts (not for public distribution)
+plotting/create_gif.py
+plotting/create_comparison_gif.py
+plotting/plot_domain.py
