@@ -276,6 +276,7 @@ def plot_monthly_bars(
     ax.set_title(f"Monthly mean score at {lead_time}-minute lead time — model comparison")
     ax.set_xlabel("Month")
     ax.set_ylabel("Score (W/m²)")
+    ax.set_ylim(bottom=0, top=100)
     ax.set_xticks(x)
     ax.set_xticklabels([_month_label(m) for m in months], rotation=45, ha="right")
     ax.grid(True, axis="y", alpha=0.3)

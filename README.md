@@ -309,6 +309,129 @@ each requested `--lead-time` must be present in the CSVs, otherwise a clear erro
 missing lead time is raised. Coverage may differ between models (missing days/months); the
 aggregation is a mean over available days, so both curves/bars still render for the data present.
 
+## ☀️ Pyranometer point validation (DINI & nowcast vs ground truth)
+
+In addition to grid-vs-grid validation, `run_validation_pyranometer.py` compares both
+the DINI NWP forecast and the satellite nowcast against two DTU pyranometer stations
+(Risoe, Lyngby) at their exact coordinates.
+
+### Why this needs its own pipeline
+The three GHI sources have different native time resolution and accumulation
+conventions, reconciled in `src/sunflow_scores/time_alignment.py`:
+
+| Source | Native resolution | Convention |
+|---|---|---|
+| Satellite nowcast | 15 min | `"12:00"` = avg[12:00, 12:15) — start-labelled |
+| Pyranometer | 10s (Risoe) / 1min (Lyngby) | grouped to `"12:00"` = avg[12:00, 12:15) — start-labelled |
+| DINI | hourly, cumulative-since-forecast-start | `"13:00"` (ref 12:00 + step 1h) = accumulated GHI over [12:00, 13:00) — end-labelled, 1h wide |
+
+DINI's cumulative `grad` variable (J/m2) is de-accumulated by diffing consecutive
+hourly steps, divided by 3600 to get an average W/m2 for that hour, then broadcast
+across the four 15-minute start-labelled slots within it (DINI has no intra-hour
+resolution, so all four get the same value).
+
+DINI's grid is in its own projection (`dini_projection`), so station coordinates are
+transformed with `pyproj`/`cartopy` before doing a nearest-cell `.sel()` — unlike the
+satellite nowcast, which is already on a regular lat/lon grid and reuses the existing
+`GroundScoreCalculator`'s nearest-grid-cell lookup unchanged.
+
+Both forecasts also have a real-world **availability latency** before they're actually
+downloadable: DINI takes ~3 hours (compute + data-transfer), the nowcast ~15-30
+minutes. A `lead_time=0` value exists in the raw aligned data but was never actually
+available at its own valid_time, so `run_validation_pyranometer.py` drops lead times
+below each source's latency (`time_alignment.filter_usable_lead_times`,
+`DINI_MIN_USABLE_LEAD_TIME` = 3h, `NOWCAST_MIN_USABLE_LEAD_TIME` = 30min) before
+computing scores or saving the aligned NetCDFs — otherwise the "which model wins"
+comparison would overstate both forecasts' real usefulness.
+
+Clear-sky index (kt) scoring is intentionally out of scope for this pipeline for now,
+since neither the raw pyranometer CSVs nor the DINI zarr carry a clear-sky GHI
+variable; QC of the raw pyranometer signal (e.g. night-time dark-offset) is also left
+to dedicated tooling such as [solarpy](https://github.com/AssessingSolar/solarpy)
+rather than done here.
+
+### Station registry
+Station coordinates live in `src/sunflow_scores/stations.py`:
+- **Risoe**: 55.694243°N, 12.101793°E
+- **Lyngby**: 55.79064°N, 12.52505°E, 50m AMSL (DTU Building 119 rooftop)
+
+### Running it
+```bash
+uv run python run_validation_pyranometer.py \
+  --start 2025-06-01 --end 2025-06-07 \
+  --pyranometer-dir /dmidata/projects/energivejr-data/pyranometers \
+  --dini-path /dmidata/projects/energivejr-data/dini/consolidated/dini_sharded.zarr \
+  --nwc-dir /dmidata/projects/energivejr-data/nowcasts/v1.0.0/202506 \
+  --output-dir results/pyranometer
+```
+
+**Command-line options:**
+
+Use `--mode nowcast` or `--mode dini` to run one comparison at a time (default: `both`).
+This matters because **DINI point extraction is much slower than the nowcast
+comparison for the same date range**: the zarr store's chunks each cover the *entire*
+spatial grid (~24MB) but only a single `(init, step)` pair, so extracting even 2
+station pixels still reads one full chunk per init/step — runtime scales with the
+date range, not the number of stations. A progress bar reports chunk-read progress
+so a long-running DINI extraction doesn't look stuck.
+
+Restrict to a single station with `--station {risoe,lyngby}`:
+```bash
+uv run python run_validation_pyranometer.py --mode nowcast --station risoe \
+  --start 2025-06-01 --end 2025-06-07 \
+  --pyranometer-dir /dmidata/projects/energivejr-data/pyranometers \
+  --nwc-dir /dmidata/projects/energivejr-data/nowcasts/v1.0.0/202506 \
+  --output-dir results/pyranometer
+```
+
+Filter to daytime hours only (sunrise to sunset per station) with `--daytime-only`:
+```bash
+uv run python run_validation_pyranometer.py --daytime-only \
+  --start 2025-06-01 --end 2025-06-07 \
+  --pyranometer-dir /dmidata/projects/energivejr-data/pyranometers \
+  --dini-path /dmidata/projects/energivejr-data/dini/consolidated/dini_sharded.zarr \
+  --nwc-dir /dmidata/projects/energivejr-data/nowcasts/v1.0.0/202506 \
+  --output-dir results/pyranometer
+```
+
+`--pyranometer-dir` must contain `risoe/` and `lyngby/` subdirectories with the raw
+CSVs. For Lyngby, two raw sources from the same instrument are concatenated
+automatically by date: `dtu_2025_MM.csv` for Jan-Mar 2025, and
+`SR300_GHI_DTU_Lyngby_*.csv` from April 2025 onward.
+
+Writes four CSVs to `--output-dir`:
+- `dini_by_init.csv`, `dini_by_station.csv` — DINI vs pyranometer
+- `nowcast_by_init.csv`, `nowcast_by_station.csv` — satellite nowcast vs pyranometer
+
+The `_by_init` files carry a `lead_time_minutes` column (per-station-averaged scores
+by initialization/lead time); the `_by_station` files give one overall MAE/RMSE per
+station. The `*_aligned.nc` files carry the full (initialization_time, lead_time,
+station_id) forecast/observation grid (not just the summary scores) and feed the two
+plotting scripts below.
+
+### Plotting: time series and lead-time skill comparison
+```bash
+# Overlay nowcast, DINI, and pyranometer GHI at a fixed lead time, one plot per station
+uv run python plotting/plot_pyranometer_timeseries.py \
+  --input-dir results/pyranometer \
+  --lead-time-minutes 0 \
+  --output-dir plots
+
+# MAE/RMSE vs lead time for both sources, marking where DINI overtakes the nowcast
+uv run python plotting/plot_pyranometer_leadtime_scores.py \
+  --input-dir results/pyranometer \
+  --metric both \
+  --output-dir plots
+```
+`plot_pyranometer_timeseries.py` reads whichever of `dini_aligned.nc` /
+`nowcast_aligned.nc` are present and needs at least one; `--station` selects specific
+stations (default: all present). `plot_pyranometer_leadtime_scores.py` requires both
+`dini_by_init.csv` and `nowcast_by_init.csv`, averages each metric over all
+initialization times per lead time, and reports the crossover lead time (or that DINI
+is already ahead at the shortest shared lead time, or that it never catches up within
+the nowcast's own lead-time range — the nowcast tops out around 6h, DINI extends
+further).
+
 ## 📂 Project Structure
 ```text
 sunflow-scores/
@@ -317,6 +440,11 @@ sunflow-scores/
 │       ├── __init__.py
 │       ├── validator.py         # Core library: SatelliteNowcastLoader, SatelliteObservationLoader,
 │       │                         # ScoreCalculator, GroundScoreCalculator
+│       ├── stations.py          # Pyranometer station registry (lat/lon/alt)
+│       ├── time_alignment.py    # 15-min resampling + DINI de-accumulation label-convention rules
+│       ├── pyranometer_loader.py  # RisoePyranometerLoader, LyngbyPyranometerLoader
+│       ├── dini_loader.py       # DiniPointLoader: point extraction from the DINI zarr forecast
+│       ├── point_score_calculator.py  # PointScoreCalculator: scores for two pre-extracted point series
 │       └── plot_utils.py        # Shared plotting utilities (CSV loading, metric columns, helpers)
 ├── plotting/
 │   ├── plot_daily_scores.py         # Plot one day or a directory of daily CSVs (heatmaps)
@@ -324,12 +452,18 @@ sunflow-scores/
 │   ├── plot_leadtime_monthly.py     # Plot per-month scores for a single chosen lead time
 │   ├── plot_leadtime_curves.py      # Plot scores across lead-time horizons (0–360 min)
 │   ├── plot_seasonal_diurnal_cycles.py  # Plot 4-season averages of monthly diurnal-cycle curves
-│   └── plot_model_comparison.py     # Compare two model versions: lead-time line + monthly bars
+│   ├── plot_model_comparison.py     # Compare two model versions: lead-time line + monthly bars
+│   ├── plot_pyranometer_timeseries.py     # Nowcast/DINI/pyranometer GHI time series overlay
+│   └── plot_pyranometer_leadtime_scores.py  # MAE/RMSE vs lead time: DINI vs nowcast, with crossover
 ├── tests/
 │   ├── test_validation.py           # Validation pipeline tests
 │   ├── test_model_comparison.py     # Model comparison logic tests
-│   └── test_score_computation_resilience.py  # Corruption handling tests
+│   ├── test_score_computation_resilience.py  # Corruption handling tests
+│   ├── test_time_alignment.py       # 15-min resampling / DINI de-accumulation tests
+│   ├── test_pyranometer_loader.py   # Risoe/Lyngby CSV loader tests (incl. Lyngby source cutover)
+│   └── test_point_score_calculator.py  # Point alignment + MAE/RMSE tests
 ├── run_validation.py            # Daily validation script: writes one scores_YYYYMMDD.csv per run
+├── run_validation_pyranometer.py  # Point validation: DINI & nowcast vs pyranometer ground truth
 ├── run_validation.sh            # Parameterized validation runner
 ├── pyproject.toml               # uv dependency definitions
 ├── uv.lock                      # Strictly locked dependency hashes

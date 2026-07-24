@@ -201,7 +201,7 @@ def plot_leadtime_average(csv_dir: Path, output_dir: Path) -> Path:
     frames = []
     for path in csv_files:
         df = _load_daily_csv(path)
-        df = _filter_nowcasts_with_nan_at_leadtime_0(df)
+        #df = _filter_nowcasts_with_nan_at_leadtime_0(df)
         daily = df.groupby("lead_time_minutes", as_index=False)[["mae_by_init", "rmse_by_init"]].mean()
         frames.append(daily)
 

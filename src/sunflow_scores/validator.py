@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 import scores.continuous
 import xarray as xr
+from dask.diagnostics import ProgressBar
 
 # errno values that indicate a transient/remote filesystem hiccup rather than
 # a real problem with the file itself; worth a short retry before giving up.
@@ -1032,34 +1033,36 @@ class GroundScoreCalculator:
         n_init = nwc.sizes["initialization_time"]
         n_lead = nwc.sizes["lead_time"]
 
-        # Extract nowcast at station grid cells: (init, lead, n_stations)
-        nwc_at_stations = np.full((n_init, n_lead, n_stations), np.nan, dtype=np.float32)
-        obs_at_stations = np.full((n_init, n_lead, n_stations), np.nan, dtype=np.float32)
-        cs_at_stations  = np.full((n_init, n_lead, n_stations), np.nan, dtype=np.float32)
+        # Extract nowcast at all station grid cells in a single vectorized
+        # selection + one dask compute, instead of looping per station: each
+        # `.isel(lat=li, lon=loi).values` call in the old loop re-triggered a
+        # full separate dask graph execution (re-reading every underlying
+        # nowcast file/chunk once per station), which dominated runtime for
+        # long date ranges.
+        lat_idx_da = xr.DataArray(lat_idxs, dims="station_id")
+        lon_idx_da = xr.DataArray(lon_idxs, dims="station_id")
+        point = nwc.isel(lat=lat_idx_da, lon=lon_idx_da)  # (initialization_time, lead_time, station_id)
+
+        print(f"  Extracting nowcast at {n_stations} station(s) ({n_init} init times)...")
+        with ProgressBar():
+            nwc_at_stations = point.compute(scheduler="threads", num_workers=8).values.astype(np.float32)
 
         valid_times = np.asarray(self.nowcast_data["valid_time"].values)  # (n_init, n_lead)
 
-        # Pull nowcast grid values for each station
-        for s_idx in range(n_stations):
-            li = int(lat_idxs[s_idx])
-            loi = int(lon_idxs[s_idx])
-            nwc_at_stations[:, :, s_idx] = nwc.isel(lat=li, lon=loi).values
+        # Match observations by time: reindex onto the flattened valid_time
+        # axis instead of a nested (init, lead) Python loop with per-element
+        # dict lookups.
+        flat_valid_times = pd.DatetimeIndex(valid_times.ravel())
+        obs_vars = [self.obs_ghi_var]
+        if self.obs_cs_ghi_var in self.ground_obs:
+            obs_vars.append(self.obs_cs_ghi_var)
+        reindexed = self.ground_obs[obs_vars].reindex(time=flat_valid_times)
 
-        # Match observations by time
-        obs_time = pd.DatetimeIndex(self.ground_obs["time"].values)
-        obs_ghi  = self.ground_obs[self.obs_ghi_var].values   # (n_time, n_stations)
-        obs_cs   = self.ground_obs[self.obs_cs_ghi_var].values if self.obs_cs_ghi_var in self.ground_obs else None
-
-        obs_time_to_idx = {t: i for i, t in enumerate(obs_time)}
-
-        for init_idx in range(n_init):
-            for lead_idx in range(n_lead):
-                vt = pd.Timestamp(valid_times[init_idx, lead_idx])
-                t_idx = obs_time_to_idx.get(vt)
-                if t_idx is not None:
-                    obs_at_stations[init_idx, lead_idx, :] = obs_ghi[t_idx, :]
-                    if obs_cs is not None:
-                        cs_at_stations[init_idx, lead_idx, :] = obs_cs[t_idx, :]
+        obs_at_stations = reindexed[self.obs_ghi_var].values.reshape(n_init, n_lead, n_stations).astype(np.float32)
+        if self.obs_cs_ghi_var in reindexed:
+            cs_at_stations = reindexed[self.obs_cs_ghi_var].values.reshape(n_init, n_lead, n_stations).astype(np.float32)
+        else:
+            cs_at_stations = np.full((n_init, n_lead, n_stations), np.nan, dtype=np.float32)
 
         dims   = ("initialization_time", "lead_time", "station_id")
         coords = {
